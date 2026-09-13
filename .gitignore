@@ -1,0 +1,6 @@
+.env
+venv
+bha.db
+__pycache__
+upload
+output

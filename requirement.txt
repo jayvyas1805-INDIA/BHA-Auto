@@ -1,0 +1,10 @@
+pymupdf 
+pdfplumber
+camelot
+python-dotenv
+rapidfuzz
+pydantic
+loguru
+orjson
+pytest
+langchain-mistralai

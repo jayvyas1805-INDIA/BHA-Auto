@@ -1,0 +1,199 @@
+"""
+db.py — persistence + dedup for the BHA extraction pipeline.
+
+Why SQLite:
+- Zero setup (single file, ships with Python) -- "best/optimal/easy" for a
+  mini-project. No server to run, easy to inspect (`sqlite3 bha.db`), and
+  still gives us real relational queries + a UNIQUE constraint for dedup.
+  Swapping to Postgres later is a small change (same SQL, different driver)
+  because nothing here uses SQLite-only syntax beyond AUTOINCREMENT.
+
+Why this schema shape:
+- We don't actually know all 10-12 table variants that will show up across
+  every operator's report template. Rather than hardcoding columns per
+  table type (which breaks the moment a new template adds/removes a
+  column -- the exact bug the old regex parser had), every component row
+  is stored as (component_name, properties_json) where properties_json is
+  whatever key/value pairs were found for that row (od_in, id_in,
+  torque_ft_lb, whatever). No migration needed when a new column shows up.
+- Same idea one level up: a BHA run's own metadata (kind/description/name
+  and any label we didn't recognize) is stored as extra_json so nothing
+  is silently dropped.
+
+Tables:
+  documents      one row per uploaded PDF (dedup key = file_hash)
+  wellbores      one row per WELLBORE found inside a document
+  bha_runs       one row per BHA NO entry under a wellbore
+  bha_components one row per string-component table row under a BHA run
+"""
+import hashlib
+import json
+import os
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+
+DB_PATH = os.getenv("BHA_DB_PATH", os.path.join(os.path.dirname(__file__), "bha.db"))
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS documents (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename      TEXT NOT NULL,
+    file_hash     TEXT NOT NULL UNIQUE,
+    report_date   TEXT,
+    chapter_start_page INTEGER,
+    chapter_end_page   INTEGER,
+    status        TEXT NOT NULL DEFAULT 'processing',  -- processing | done | failed
+    raw_json      TEXT,           -- full extracted JSON, for audit / re-export
+    error         TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS wellbores (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id   INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    wellbore_name TEXT
+);
+
+CREATE TABLE IF NOT EXISTS bha_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    wellbore_id   INTEGER NOT NULL REFERENCES wellbores(id) ON DELETE CASCADE,
+    bha_no        TEXT,
+    kind          TEXT,
+    description   TEXT,
+    name          TEXT,
+    extra_json    TEXT           -- any label we saw but didn't map to a known field
+);
+
+CREATE TABLE IF NOT EXISTS bha_components (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    bha_run_id    INTEGER NOT NULL REFERENCES bha_runs(id) ON DELETE CASCADE,
+    seq           INTEGER NOT NULL,   -- position within the table, top to bottom
+    component     TEXT,
+    properties_json TEXT            -- {"od_in": "...", "id_in": "...", ...} -- whatever columns this table had
+);
+
+CREATE INDEX IF NOT EXISTS idx_wellbores_document ON wellbores(document_id);
+CREATE INDEX IF NOT EXISTS idx_bha_runs_wellbore ON bha_runs(wellbore_id);
+CREATE INDEX IF NOT EXISTS idx_bha_components_run ON bha_components(bha_run_id);
+"""
+
+
+@contextmanager
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    with get_conn() as conn:
+        conn.executescript(SCHEMA)
+
+
+def compute_file_hash(pdf_path, chunk_size=1024 * 1024):
+    """Content hash, not filename -- so a re-uploaded copy with a different
+    name is still recognized as the same document, and an edited/reissued
+    PDF with the same name is correctly treated as new."""
+    h = hashlib.sha256()
+    with open(pdf_path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def find_existing(file_hash):
+    """Returns the existing documents row (as a dict) if this file was
+    already processed, else None. Caller uses this for the
+    'is it processed or not' check before doing any extraction work."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM documents WHERE file_hash = ?", (file_hash,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def start_document(filename, file_hash, chapter_start_page=None, chapter_end_page=None):
+    """Inserts a 'processing' placeholder row and returns its id. Doing this
+    before extraction (rather than only writing on success) means a crash
+    mid-extraction leaves a visible 'failed'/'processing' row instead of no
+    record at all, and a concurrent second upload of the same file will
+    hit the UNIQUE constraint instead of racing to process it twice."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO documents
+               (filename, file_hash, status, chapter_start_page, chapter_end_page, created_at, updated_at)
+               VALUES (?, ?, 'processing', ?, ?, ?, ?)""",
+            (filename, file_hash, chapter_start_page, chapter_end_page, now, now),
+        )
+        return cur.lastrowid
+
+
+def mark_failed(document_id, error):
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE documents SET status = 'failed', error = ?, updated_at = ? WHERE id = ?",
+            (str(error), now, document_id),
+        )
+
+
+def save_result(document_id, result):
+    """
+    Writes the extracted structure for a document:
+      - updates the documents row to 'done' + stores the raw JSON for audit
+      - fans wellbores -> bha_runs -> bha_components out into their tables
+
+    `result` is the dict produced by parser.parse_bha (or the LLM-normalized
+    equivalent): {"date": ..., "wellbores": [{"wellbore": ..., "bha_list": [...]}]}
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE documents
+               SET status = 'done', report_date = ?, raw_json = ?, updated_at = ?
+               WHERE id = ?""",
+            (result.get("date"), json.dumps(result, ensure_ascii=False), now, document_id),
+        )
+
+        for wb in result.get("wellbores", []):
+            wb_cur = conn.execute(
+                "INSERT INTO wellbores (document_id, wellbore_name) VALUES (?, ?)",
+                (document_id, wb.get("wellbore")),
+            )
+            wellbore_id = wb_cur.lastrowid
+
+            for run in wb.get("bha_list", []):
+                extra = run.get("attributes", {})
+                run_cur = conn.execute(
+                    """INSERT INTO bha_runs
+                       (wellbore_id, bha_no, kind, description, name, extra_json)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        wellbore_id,
+                        run.get("bha_no"),
+                        run.get("kind"),
+                        run.get("description"),
+                        run.get("name"),
+                        json.dumps(extra, ensure_ascii=False) if extra else None,
+                    ),
+                )
+                bha_run_id = run_cur.lastrowid
+
+                for seq, row in enumerate(run.get("table", [])):
+                    row = dict(row)  # don't mutate caller's data
+                    component = row.pop("string_component", None) or row.pop("component", None)
+                    conn.execute(
+                        """INSERT INTO bha_components (bha_run_id, seq, component, properties_json)
+                           VALUES (?, ?, ?, ?)""",
+                        (bha_run_id, seq, component, json.dumps(row, ensure_ascii=False)),
+                    )
+
+    return document_id
