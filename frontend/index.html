@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BHA Extraction — Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<div id="app">
+  <aside class="rail">
+    <div class="rail-head">
+      <div class="eyebrow">BHA EXTRACTION</div>
+      <div class="rail-title">Processed reports</div>
+    </div>
+
+    <label class="upload" id="upload-label">
+      <input type="file" id="file-input" accept="application/pdf" hidden />
+      <span id="upload-text">+ Upload PDF</span>
+    </label>
+    <div class="upload-note" id="upload-note" hidden></div>
+
+    <div class="doc-list" id="doc-list">
+      <div class="empty">loading…</div>
+    </div>
+  </aside>
+
+  <main class="main" id="main">
+    <div class="empty-main">Select a report</div>
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

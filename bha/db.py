@@ -33,7 +33,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-DB_PATH = os.getenv("BHA_DB_PATH", os.path.join(os.path.dirname(__file__), "bha.db"))
+from .config import DB_PATH
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -45,6 +45,9 @@ CREATE TABLE IF NOT EXISTS documents (
     chapter_end_page   INTEGER,
     status        TEXT NOT NULL DEFAULT 'processing',  -- processing | done | failed
     raw_json      TEXT,           -- full extracted JSON, for audit / re-export
+    confidence    TEXT,           -- high | medium | low, see validate.py
+    needs_review  INTEGER DEFAULT 0,
+    warnings_json TEXT,           -- list of human-readable warning strings
     error         TEXT,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
@@ -145,22 +148,35 @@ def mark_failed(document_id, error):
         )
 
 
-def save_result(document_id, result):
+def save_result(document_id, result, validation=None):
     """
     Writes the extracted structure for a document:
       - updates the documents row to 'done' + stores the raw JSON for audit
+      - stores the confidence tier / warnings from validate.validate_result,
+        if given, so a low-confidence row is visible with a plain SQL query
+        instead of requiring someone to re-parse raw_json to notice it
       - fans wellbores -> bha_runs -> bha_components out into their tables
 
     `result` is the dict produced by parser.parse_bha (or the LLM-normalized
     equivalent): {"date": ..., "wellbores": [{"wellbore": ..., "bha_list": [...]}]}
     """
     now = datetime.now(timezone.utc).isoformat()
+    validation = validation or {}
     with get_conn() as conn:
         conn.execute(
             """UPDATE documents
-               SET status = 'done', report_date = ?, raw_json = ?, updated_at = ?
+               SET status = 'done', report_date = ?, raw_json = ?, updated_at = ?,
+                   confidence = ?, needs_review = ?, warnings_json = ?
                WHERE id = ?""",
-            (result.get("date"), json.dumps(result, ensure_ascii=False), now, document_id),
+            (
+                result.get("date"),
+                json.dumps(result, ensure_ascii=False),
+                now,
+                validation.get("confidence"),
+                1 if validation.get("needs_review") else 0,
+                json.dumps(validation.get("warnings", []), ensure_ascii=False),
+                document_id,
+            ),
         )
 
         for wb in result.get("wellbores", []):

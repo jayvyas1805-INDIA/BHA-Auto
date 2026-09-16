@@ -1,6 +1,18 @@
+# Secrets — never commit
 .env
-venv
+
+# Local state
 bha.db
-__pycache__
-upload
-output
+output/*.json
+upload/*.pdf
+upload/*.PDF
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# OS
+.DS_Store

@@ -93,8 +93,13 @@ def parse_label_line(stripped):
 
 
 def is_label_line(stripped):
-    """Back-compat helper: True/False-style check used by the table-boundary
-    detector to know when a new metadata block starts."""
+    """True/False-style check used by the table-boundary detector to know
+    when a new metadata block starts (so borderless table extraction stops
+    consuming rows). Returns a bool -- callers must check truthiness
+    (`if is_label_line(x):`), NOT `is not None` (a bool is never None, so
+    that comparison is always True and silently breaks borderless
+    extraction after zero rows -- this exact bug shipped once already,
+    see tests/test_parser.py::test_borderless_table_actually_collects_rows)."""
     return parse_label_line(stripped) is not None
 
 
@@ -199,7 +204,7 @@ def extract_borderless_table(lines, start_idx):
             i += 1
             continue
 
-        if is_label_line(stripped) is not None:
+        if is_label_line(stripped):
             break
 
         buckets = {"string_component": [], "od_in": [], "id_in": [], "length_m": [], "acc_length_m": []}

@@ -2,17 +2,14 @@ import os
 import sys
 import json
 
-from reader import read_pdf
-from toc import find_bha_chapter
-from detector import detect_section
-from parser import parse_bha
-from writer import save_json
-import db
-
-# Flip this on once you've confirmed api.mistral.ai is reachable from your
-# environment and MISTRAL_API_KEY is set. Off by default so the pipeline
-# still runs end-to-end (deterministic parser only) with no network/API key.
-USE_LLM_NORMALIZATION = os.getenv("USE_LLM_NORMALIZATION", "false").lower() == "true"
+from .reader import read_pdf
+from .toc import find_bha_chapter
+from .detector import detect_section
+from .parser import parse_bha
+from .writer import save_json
+from .validate import validate_result
+from . import db
+from .config import OUTPUT_DIR, USE_LLM_NORMALIZATION, ensure_dirs
 
 
 def get_chapter_pages(pages):
@@ -47,8 +44,9 @@ def get_chapter_pages(pages):
 
 def run(pdf_path, json_output=None):
     filename = os.path.basename(pdf_path)
-    json_output = json_output or os.path.join("output", os.path.splitext(filename)[0] + ".json")
+    json_output = json_output or os.path.join(OUTPUT_DIR, os.path.splitext(filename)[0] + ".json")
 
+    ensure_dirs()
     db.init_db()
 
     print("checking if this file was already processed..")
@@ -69,6 +67,7 @@ def run(pdf_path, json_output=None):
 
     document_id = db.start_document(filename, file_hash, start + 1, end + 1)
 
+    llm_errors = None
     try:
         print("parsing chapter..")
         data = parse_bha(chapter_pages)
@@ -77,12 +76,23 @@ def run(pdf_path, json_output=None):
             print("normalizing with LLM..")
             from llm_extractor import extract_bha_with_llm
             from merger import merge_llm_chunks  # see merger.py
-            chunk_results = extract_bha_with_llm(chapter_pages)
+            chunk_results, llm_errors = extract_bha_with_llm(chapter_pages)
+            if llm_errors:
+                for pages_failed, err in llm_errors:
+                    print(f"  warning: LLM call failed for pages {pages_failed} after retries: {err}")
             data = merge_llm_chunks(chunk_results, fallback=data)
+
+        validation = validate_result(data, method, llm_errors=llm_errors)
+        if validation["warnings"]:
+            print("validation warnings:")
+            for w in validation["warnings"]:
+                print(f"  - {w}")
+        print(f"confidence: {validation['confidence']}"
+              + ("  (FLAGGED FOR REVIEW)" if validation["needs_review"] else ""))
 
         print("saving output..")
         save_json(data, json_output)
-        db.save_result(document_id, data)
+        db.save_result(document_id, data, validation=validation)
 
     except Exception as e:
         db.mark_failed(document_id, e)
@@ -90,9 +100,3 @@ def run(pdf_path, json_output=None):
 
     print(f"done ✔  (document id={document_id})")
     return data
-
-
-if __name__ == "__main__":
-    pdf_arg = sys.argv[1] if len(sys.argv) > 1 else input("Enter the path to the PDF file: ")
-    out_arg = sys.argv[2] if len(sys.argv) > 2 else None
-    run(pdf_arg, out_arg)

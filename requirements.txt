@@ -1,0 +1,13 @@
+# Core pipeline
+pdfplumber
+python-dotenv
+requests
+
+# API service
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Tests (the suite also runs on stdlib unittest with no install:
+#   python -m unittest discover -s tests -t .)
+pytest
