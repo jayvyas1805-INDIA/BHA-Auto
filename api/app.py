@@ -39,7 +39,7 @@ from fastapi.staticfiles import StaticFiles
 
 from bha import db
 from bha.config import CORS_ORIGINS, FRONTEND_DIR, UPLOAD_DIR, ensure_dirs
-from bha.pipeline import run as run_pipeline
+from bha.pipeline import process as process_document
 
 logger = logging.getLogger(__name__)
 
@@ -62,14 +62,15 @@ app.add_middleware(
 )
 
 
-def _process_in_background(pdf_path, filename):
-    """Runs via BackgroundTasks. pipeline.run() already writes success or
-    failure into the documents table (status + error columns), so a client
-    polling /status sees the outcome either way -- this wrapper just makes
-    sure an unexpected exception gets logged rather than vanishing, since
-    BackgroundTasks doesn't surface exceptions to any caller."""
+def _process_in_background(document_id, pdf_path, filename):
+    """Runs via BackgroundTasks. pipeline.process() already moves the row
+    through db.STAGES and writes success/failure into the documents table,
+    so a client polling /status sees the outcome either way -- this wrapper
+    just makes sure an unexpected exception gets logged rather than
+    vanishing, since BackgroundTasks doesn't surface exceptions to any
+    caller."""
     try:
-        run_pipeline(pdf_path)
+        process_document(document_id, pdf_path)
     except Exception:
         logger.exception(f"background processing failed for {filename}")
 
@@ -96,8 +97,7 @@ async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = 
         shutil.copyfileobj(file.file, f)
 
     # Dedup up front: if this exact content was already processed, say so
-    # immediately rather than starting a background task that would just
-    # hit the same check inside pipeline.run() and skip.
+    # immediately rather than starting a background task for nothing.
     db.init_db()
     file_hash = db.compute_file_hash(dest_path)
     existing = db.find_existing(file_hash)
@@ -105,15 +105,24 @@ async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = 
         return {"document_id": existing["id"], "status": "already_processed",
                 "filename": existing["filename"]}
 
-    background_tasks.add_task(_process_in_background, dest_path, file.filename)
-    return {"status": "processing_started", "filename": file.filename}
+    # Create the row now, before any extraction work, so the caller gets an
+    # id immediately -- that's what the live progress page polls via
+    # GET /api/documents/{id}/status while the background task moves it
+    # through db.STAGES.
+    if existing:
+        document_id = existing["id"]
+        db.requeue(document_id)   # clears stale error/stage from a prior failed/stuck run
+    else:
+        document_id = db.create_placeholder(file.filename, file_hash)
+    background_tasks.add_task(_process_in_background, document_id, dest_path, file.filename)
+    return {"document_id": document_id, "status": "queued", "filename": file.filename}
 
 
 @app.get("/api/documents")
 def list_documents():
     with db.get_conn() as conn:
         rows = conn.execute(
-            """SELECT id, filename, status, confidence, needs_review, report_date,
+            """SELECT id, filename, status, stage, confidence, needs_review, report_date,
                       chapter_start_page, chapter_end_page, created_at, updated_at
                FROM documents ORDER BY id DESC"""
         ).fetchall()
@@ -133,7 +142,7 @@ def get_document(document_id: int):
 def get_status(document_id: int):
     with db.get_conn() as conn:
         row = conn.execute(
-            "SELECT id, status, confidence, needs_review, error FROM documents WHERE id = ?",
+            "SELECT id, status, stage, confidence, needs_review, error FROM documents WHERE id = ?",
             (document_id,),
         ).fetchone()
         if not row:
@@ -148,6 +157,10 @@ if os.path.isdir(FRONTEND_DIR):
     @app.get("/")
     def index():
         return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
+
+    @app.get("/upload")
+    def upload_page():
+        return FileResponse(os.path.join(FRONTEND_DIR, "upload.html"))
 
 
 # --- Known limits before calling this "production" ---

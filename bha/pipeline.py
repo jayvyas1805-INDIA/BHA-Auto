@@ -1,5 +1,4 @@
 import os
-import sys
 import json
 
 from .reader import read_pdf
@@ -42,10 +41,77 @@ def get_chapter_pages(pages):
     return pages, "none_matched", (0, len(pages) - 1)
 
 
-def run(pdf_path, json_output=None):
+def process(document_id, pdf_path, json_output=None):
+    """
+    Runs extraction for a document row that already exists (created via
+    db.create_placeholder, typically right at upload time so the caller has
+    an id to poll immediately). Moves the row through db.STAGES as it goes:
+
+        queued -> reading_pdf -> locating_chapter -> parsing
+               -> [normalizing, only if USE_LLM_NORMALIZATION] -> validating
+               -> saving -> done   (or -> failed, with `error` set)
+
+    This is what api/app.py's background task calls, and what the live
+    progress page (frontend/upload.js) is polling GET /status to watch move
+    through. run() below wraps this for the CLI, where there's no separate
+    "give me an id first" step needed.
+    """
     filename = os.path.basename(pdf_path)
     json_output = json_output or os.path.join(OUTPUT_DIR, os.path.splitext(filename)[0] + ".json")
+    llm_errors = None
 
+    try:
+        db.set_stage(document_id, "reading_pdf")
+        print("reading pdf..")
+        pages = read_pdf(pdf_path)
+
+        db.set_stage(document_id, "locating_chapter")
+        print("locating BHA chapter..")
+        chapter_pages, method, (start, end) = get_chapter_pages(pages)
+        print(f"  -> found via {method}, pages {start + 1}-{end + 1} of {len(pages)}")
+        db.update_chapter_pages(document_id, start + 1, end + 1)
+
+        db.set_stage(document_id, "parsing")
+        print("parsing chapter..")
+        data = parse_bha(chapter_pages)
+
+        if USE_LLM_NORMALIZATION:
+            db.set_stage(document_id, "normalizing")
+            print("normalizing with LLM..")
+            from .llm_extractor import extract_bha_with_llm
+            from .merger import merge_llm_chunks
+            chunk_results, llm_errors = extract_bha_with_llm(chapter_pages)
+            if llm_errors:
+                for pages_failed, err in llm_errors:
+                    print(f"  warning: LLM call failed for pages {pages_failed} after retries: {err}")
+            data = merge_llm_chunks(chunk_results, fallback=data)
+
+        db.set_stage(document_id, "validating")
+        validation = validate_result(data, method, llm_errors=llm_errors)
+        if validation["warnings"]:
+            print("validation warnings:")
+            for w in validation["warnings"]:
+                print(f"  - {w}")
+        print(f"confidence: {validation['confidence']}"
+              + ("  (FLAGGED FOR REVIEW)" if validation["needs_review"] else ""))
+
+        db.set_stage(document_id, "saving")
+        print("saving output..")
+        save_json(data, json_output)
+        db.save_result(document_id, data, validation=validation)  # also sets stage='done'
+
+    except Exception as e:
+        db.mark_failed(document_id, e)  # also sets stage='failed'
+        raise
+
+    print(f"done \u2714  (document id={document_id})")
+    return data
+
+
+def run(pdf_path, json_output=None):
+    """CLI convenience wrapper: handles the dedup check and placeholder-row
+    creation that api/app.py does itself (so it can hand back an id at
+    upload time), then delegates to process()."""
     ensure_dirs()
     db.init_db()
 
@@ -58,45 +124,10 @@ def run(pdf_path, json_output=None):
     if existing and existing["status"] == "processing":
         print("warning: a previous run on this file didn't finish cleanly (status=processing). re-running.")
 
-    print("reading pdf..")
-    pages = read_pdf(pdf_path)
-
-    print("locating BHA chapter..")
-    chapter_pages, method, (start, end) = get_chapter_pages(pages)
-    print(f"  -> found via {method}, pages {start + 1}-{end + 1} of {len(pages)}")
-
-    document_id = db.start_document(filename, file_hash, start + 1, end + 1)
-
-    llm_errors = None
-    try:
-        print("parsing chapter..")
-        data = parse_bha(chapter_pages)
-
-        if USE_LLM_NORMALIZATION:
-            print("normalizing with LLM..")
-            from llm_extractor import extract_bha_with_llm
-            from merger import merge_llm_chunks  # see merger.py
-            chunk_results, llm_errors = extract_bha_with_llm(chapter_pages)
-            if llm_errors:
-                for pages_failed, err in llm_errors:
-                    print(f"  warning: LLM call failed for pages {pages_failed} after retries: {err}")
-            data = merge_llm_chunks(chunk_results, fallback=data)
-
-        validation = validate_result(data, method, llm_errors=llm_errors)
-        if validation["warnings"]:
-            print("validation warnings:")
-            for w in validation["warnings"]:
-                print(f"  - {w}")
-        print(f"confidence: {validation['confidence']}"
-              + ("  (FLAGGED FOR REVIEW)" if validation["needs_review"] else ""))
-
-        print("saving output..")
-        save_json(data, json_output)
-        db.save_result(document_id, data, validation=validation)
-
-    except Exception as e:
-        db.mark_failed(document_id, e)
-        raise
-
-    print(f"done ✔  (document id={document_id})")
-    return data
+    filename = os.path.basename(pdf_path)
+    if existing:
+        document_id = existing["id"]
+        db.requeue(document_id)
+    else:
+        document_id = db.create_placeholder(filename, file_hash)
+    return process(document_id, pdf_path, json_output)

@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BHA Extraction — Upload &amp; Process</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<div id="app">
+  <aside class="rail">
+    <div class="rail-head">
+      <div class="eyebrow">BHA EXTRACTION</div>
+      <div class="rail-title">Upload &amp; process</div>
+    </div>
+
+    <nav class="nav">
+      <a class="nav-link" href="/">Dashboard</a>
+      <a class="nav-link active" href="/upload">Upload &amp; Process</a>
+    </nav>
+
+    <div class="doc-list" id="queue-list">
+      <div class="empty">no jobs yet this session</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="upload-main" id="upload-main">
+
+      <label class="dropzone" id="dropzone">
+        <input type="file" id="file-input" accept="application/pdf" hidden />
+        <div class="dropzone-icon">＋</div>
+        <div class="dropzone-title">Drop a PDF here, or click to choose one</div>
+        <div class="dropzone-sub">Any Final Well Report — the pipeline finds the BHA chapter itself</div>
+      </label>
+
+      <div class="job hidden" id="job">
+        <div class="job-head">
+          <div>
+            <div class="job-file" id="job-filename">—</div>
+            <div class="job-sub" id="job-sub">—</div>
+          </div>
+          <span class="badge processing" id="job-badge"><span class="dot"></span>queued</span>
+        </div>
+
+        <ol class="steps" id="steps"></ol>
+
+        <div class="job-error hidden" id="job-error"></div>
+        <div class="job-actions hidden" id="job-actions">
+          <a class="btn" id="job-view-link" href="#">View extracted data →</a>
+          <button class="btn btn-ghost" id="job-another">Process another</button>
+        </div>
+      </div>
+
+    </div>
+  </main>
+</div>
+<script src="/static/shared.js"></script>
+<script src="/static/upload.js"></script>
+</body>
+</html>

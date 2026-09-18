@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS documents (
     chapter_start_page INTEGER,
     chapter_end_page   INTEGER,
     status        TEXT NOT NULL DEFAULT 'processing',  -- processing | done | failed
+    stage         TEXT NOT NULL DEFAULT 'queued',       -- see STAGES below
     raw_json      TEXT,           -- full extracted JSON, for audit / re-export
     confidence    TEXT,           -- high | medium | low, see validate.py
     needs_review  INTEGER DEFAULT 0,
@@ -82,6 +83,22 @@ CREATE INDEX IF NOT EXISTS idx_bha_runs_wellbore ON bha_runs(wellbore_id);
 CREATE INDEX IF NOT EXISTS idx_bha_components_run ON bha_components(bha_run_id);
 """
 
+# Ordered pipeline stages -- the frontend's progress page (frontend/upload.js)
+# hardcodes this same list to render a step tracker. Keep the two in sync if
+# you add a stage. 'done' is the terminal success value; there is
+# deliberately no terminal 'failed' stage value -- see mark_failed's
+# docstring for why.
+STAGES = [
+    "queued",
+    "reading_pdf",
+    "locating_chapter",
+    "parsing",
+    "normalizing",   # only visited when USE_LLM_NORMALIZATION=true
+    "validating",
+    "saving",
+    "done",
+]
+
 
 @contextmanager
 def get_conn():
@@ -98,6 +115,31 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn):
+    """
+    CREATE TABLE IF NOT EXISTS only helps for a brand-new database -- it
+    does nothing to a documents table that already exists from an older
+    version of this schema (e.g. before confidence/needs_review/
+    warnings_json were added), which is exactly what produced:
+        sqlite3.OperationalError: no such column: confidence
+
+    This adds any column that SCHEMA declares but the existing table is
+    missing, so an old bha.db from a previous run of this project upgrades
+    in place instead of requiring "just delete the db file" forever.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
+    wanted = {
+        "confidence": "TEXT",
+        "needs_review": "INTEGER DEFAULT 0",
+        "warnings_json": "TEXT",
+        "stage": "TEXT NOT NULL DEFAULT 'queued'",
+    }
+    for col, decl in wanted.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE documents ADD COLUMN {col} {decl}")
 
 
 def compute_file_hash(pdf_path, chunk_size=1024 * 1024):
@@ -122,29 +164,67 @@ def find_existing(file_hash):
         return dict(row) if row else None
 
 
-def start_document(filename, file_hash, chapter_start_page=None, chapter_end_page=None):
-    """Inserts a 'processing' placeholder row and returns its id. Doing this
-    before extraction (rather than only writing on success) means a crash
-    mid-extraction leaves a visible 'failed'/'processing' row instead of no
-    record at all, and a concurrent second upload of the same file will
-    hit the UNIQUE constraint instead of racing to process it twice."""
+def create_placeholder(filename, file_hash):
+    """Inserts a 'queued' row and returns its id, before anything about the
+    PDF (page count, chapter location) is known yet. This runs at upload
+    time, not after extraction starts, specifically so the API can hand the
+    caller a document_id immediately -- that id is what the live progress
+    page (frontend/upload.js) polls via GET /api/documents/{id}/status
+    while pipeline.process() moves it through STAGES."""
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         cur = conn.execute(
-            """INSERT INTO documents
-               (filename, file_hash, status, chapter_start_page, chapter_end_page, created_at, updated_at)
-               VALUES (?, ?, 'processing', ?, ?, ?, ?)""",
-            (filename, file_hash, chapter_start_page, chapter_end_page, now, now),
+            """INSERT INTO documents (filename, file_hash, status, stage, created_at, updated_at)
+               VALUES (?, ?, 'processing', 'queued', ?, ?)""",
+            (filename, file_hash, now, now),
         )
         return cur.lastrowid
 
 
+def set_stage(document_id, stage):
+    """Updates just the stage marker -- called at each step of
+    pipeline.process() so a client polling /status sees granular progress
+    instead of a single 'processing' blob for the whole run."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE documents SET stage = ?, updated_at = ? WHERE id = ?",
+            (stage, now, document_id),
+        )
+
+
+def update_chapter_pages(document_id, start_page, end_page):
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE documents SET chapter_start_page = ?, chapter_end_page = ?, updated_at = ? WHERE id = ?",
+            (start_page, end_page, now, document_id),
+        )
+
+
 def mark_failed(document_id, error):
+    """Marks the document failed WITHOUT touching `stage` -- stage keeps
+    whatever value the last successful set_stage() call left it at, so a
+    client can tell exactly which step it died on. Overwriting stage to a
+    literal 'failed' here would erase that information; status='failed' is
+    what signals failure, stage says where."""
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         conn.execute(
             "UPDATE documents SET status = 'failed', error = ?, updated_at = ? WHERE id = ?",
             (str(error), now, document_id),
+        )
+
+
+def requeue(document_id):
+    """Resets a stuck/failed row (e.g. a previous run that never finished
+    cleanly) back to 'queued' so it can be reprocessed under the same id,
+    instead of leaving stale error/stage values visible while it reruns."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE documents SET status = 'processing', stage = 'queued', error = NULL, updated_at = ? WHERE id = ?",
+            (now, document_id),
         )
 
 
@@ -165,8 +245,8 @@ def save_result(document_id, result, validation=None):
     with get_conn() as conn:
         conn.execute(
             """UPDATE documents
-               SET status = 'done', report_date = ?, raw_json = ?, updated_at = ?,
-                   confidence = ?, needs_review = ?, warnings_json = ?
+               SET status = 'done', stage = 'done', report_date = ?, raw_json = ?, updated_at = ?,
+                   confidence = ?, needs_review = ?, warnings_json = ?, error = NULL
                WHERE id = ?""",
             (
                 result.get("date"),

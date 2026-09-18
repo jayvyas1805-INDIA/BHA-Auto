@@ -1,11 +1,6 @@
-/* app.js — talks to the live FastAPI service at /api.
- *
- * Same-origin by default (the API serves this file), so no CORS involved.
- * Set window.API_BASE before loading this script to point at a different
- * host, e.g. when running a separate dev server.
+/* app.js — dashboard: browse processed documents. Uses API/el/num/api/badge
+ * from shared.js (loaded first, see index.html).
  */
-const API = (window.API_BASE || "") + "/api";
-
 const state = {
   documents: [],
   selectedId: null,
@@ -13,38 +8,6 @@ const state = {
   activeWellbore: 0,
   polling: new Set(),    // document ids currently being polled
 };
-
-/* ---------------- utilities ---------------- */
-
-const el = (tag, cls, text) => {
-  const n = document.createElement(tag);
-  if (cls) n.className = cls;
-  if (text !== undefined) n.textContent = text;   // textContent, never innerHTML:
-  return n;                                        // filenames and extracted PDF
-};                                                 // strings are untrusted input
-
-function num(v) {
-  if (v === null || v === undefined) return null;
-  const f = parseFloat(String(v).replace(",", "."));
-  return Number.isFinite(f) ? f : null;
-}
-
-async function api(path, options) {
-  const res = await fetch(API + path, options);
-  if (!res.ok) {
-    let detail = res.statusText;
-    try { detail = (await res.json()).detail || detail; } catch (_) {}
-    throw new Error(detail);
-  }
-  return res.json();
-}
-
-function badge(level) {
-  const b = el("span", "badge " + (level || "processing"));
-  b.appendChild(el("span", "dot"));
-  b.appendChild(document.createTextNode(level || "processing"));
-  return b;
-}
 
 /* ---------------- left rail ---------------- */
 
@@ -295,55 +258,14 @@ function pollDocument(id) {
   setTimeout(tick, 2000);
 }
 
-/* ---------------- upload ---------------- */
-
-function setUploadNote(msg, isError) {
-  const note = document.getElementById("upload-note");
-  note.textContent = msg || "";
-  note.className = "upload-note" + (isError ? " err" : "");
-  note.hidden = !msg;
-}
-
-async function handleUpload(file) {
-  const label = document.getElementById("upload-label");
-  const text = document.getElementById("upload-text");
-  label.classList.add("busy");
-  text.textContent = "uploading…";
-  setUploadNote("");
-
-  try {
-    const fd = new FormData();
-    fd.append("file", file);
-    const res = await api("/documents", { method: "POST", body: fd });
-
-    if (res.status === "already_processed") {
-      setUploadNote("already processed — showing the existing result");
-      await loadDocuments();
-      await selectDocument(res.document_id);
-    } else {
-      setUploadNote("processing started…");
-      await loadDocuments();
-      // The new row appears with status=processing; loadDocuments starts
-      // polling it, and the poll callback refreshes the view when it lands.
-    }
-  } catch (e) {
-    setUploadNote(String(e.message || e), true);
-  } finally {
-    label.classList.remove("busy");
-    text.textContent = "+ Upload PDF";
-  }
-}
-
 /* ---------------- init ---------------- */
 
-document.getElementById("file-input").addEventListener("change", (e) => {
-  const f = e.target.files[0];
-  if (f) handleUpload(f);
-  e.target.value = "";   // let the same file be re-selected later
-});
-
 loadDocuments().then(() => {
-  if (state.documents.length && state.selectedId === null) {
+  const params = new URLSearchParams(window.location.search);
+  const docParam = parseInt(params.get("doc"), 10);
+  if (docParam && state.documents.some((d) => d.id === docParam)) {
+    selectDocument(docParam);
+  } else if (state.documents.length && state.selectedId === null) {
     selectDocument(state.documents[0].id);
   }
 });

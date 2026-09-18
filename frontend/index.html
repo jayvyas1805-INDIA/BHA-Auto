@@ -17,11 +17,10 @@
       <div class="rail-title">Processed reports</div>
     </div>
 
-    <label class="upload" id="upload-label">
-      <input type="file" id="file-input" accept="application/pdf" hidden />
-      <span id="upload-text">+ Upload PDF</span>
-    </label>
-    <div class="upload-note" id="upload-note" hidden></div>
+    <nav class="nav">
+      <a class="nav-link active" href="/">Dashboard</a>
+      <a class="nav-link" href="/upload">Upload &amp; Process</a>
+    </nav>
 
     <div class="doc-list" id="doc-list">
       <div class="empty">loading…</div>
@@ -32,6 +31,7 @@
     <div class="empty-main">Select a report</div>
   </main>
 </div>
+<script src="/static/shared.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

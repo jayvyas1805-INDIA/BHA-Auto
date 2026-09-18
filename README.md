@@ -40,11 +40,14 @@ bha-extraction/
 │   └── app.py              FastAPI: /api routes + serves the frontend
 │
 ├── frontend/               no build step — plain HTML/CSS/JS
-│   ├── index.html
-│   ├── styles.css
-│   └── app.js
+│   ├── index.html          dashboard: browse processed documents
+│   ├── upload.html         dedicated upload page with live stage tracker
+│   ├── shared.js           fetch/DOM helpers used by both pages
+│   ├── app.js              dashboard logic
+│   ├── upload.js           upload + polling + step-tracker logic
+│   └── styles.css
 │
-├── tests/                  33 tests, runnable with stdlib unittest
+├── tests/                  41 tests, runnable with stdlib unittest
 ├── upload/                 PDFs land here
 └── output/                 JSON results
 ```
@@ -153,11 +156,21 @@ USE_LLM_NORMALIZATION=true python run.py upload/REPORT.pdf
 uvicorn api.app:app --reload
 ```
 - Dashboard: http://127.0.0.1:8000/
+- Upload & Process (live progress): http://127.0.0.1:8000/upload
 - API docs: http://127.0.0.1:8000/docs
 
-Upload a PDF from the sidebar; the row appears as `processing` and the page
-polls until extraction finishes, then renders the tables and a stack diagram
-of each BHA string.
+Drop a PDF on the `/upload` page (or click to choose one) and watch it move
+through each real pipeline stage live — queued → reading PDF → locating
+chapter → parsing → (normalizing, if LLM is on) → validating → saving —
+polled from `GET /api/documents/{id}/status` roughly once a second. A failed
+extraction shows exactly which step it died on (not a generic "failed"),
+because `stage` is left at its last real value rather than being overwritten
+— see `bha/db.py::mark_failed`. When it finishes, "View extracted data"
+opens the dashboard on that exact document (`/?doc={id}`).
+
+The dashboard's own sidebar no longer has a quick-upload button — that flow
+now lives entirely on `/upload`, so there's one processing experience
+instead of two slightly different ones.
 
 **Tests:**
 ```bash
@@ -171,10 +184,10 @@ pytest tests/                                 # if you have pytest
 
 | Method | Route | Purpose |
 |---|---|---|
-| POST | `/api/documents` | upload a PDF, processed in background |
-| GET | `/api/documents` | list documents + status/confidence |
+| POST | `/api/documents` | upload a PDF; returns `document_id` immediately, processed in background |
+| GET | `/api/documents` | list documents + status/stage/confidence |
 | GET | `/api/documents/{id}` | full result incl. extracted data + warnings |
-| GET | `/api/documents/{id}/status` | lightweight polling |
+| GET | `/api/documents/{id}/status` | lightweight polling target — `status`, `stage`, `confidence`, `error` |
 
 The frontend is served same-origin by the same app, so CORS isn't involved for
 the bundled dashboard. `BHA_CORS_ORIGINS` covers the separate-dev-server case.
@@ -191,12 +204,25 @@ the bundled dashboard. `BHA_CORS_ORIGINS` covers the separate-dev-server case.
 - Confidence scoring against real results and in unit tests.
 - LLM retry/failure-isolation/response-validation and the chunk-boundary
   merge — tested with a fake HTTP layer (no real network call).
-- **The frontend, rendered in headless Chromium against a server exposing the
-  same routes and response shapes as `api/app.py`, reading the real `bha.db`.**
-  Confirmed: document list, wellbore tabs, 17 run cards, 75 table rows, 75
-  diagram segments, tab switching, and document switching — with zero JS
-  errors.
-- 33 tests passing.
+- **The dashboard**, rendered in headless Chromium against a server exposing
+  the same routes and response shapes as `api/app.py`, reading the real
+  `bha.db`. Confirmed: document list, wellbore tabs, 8+ run cards, 95+ table
+  rows, tab switching, and document switching — zero JS errors.
+- **The upload/progress page, driven end-to-end** — a real file picked
+  through Playwright, POSTed to `/api/documents`, polled live: confirmed the
+  step tracker correctly shows "Reading PDF" active while `reading_pdf` is
+  in progress, all 7 steps complete on success, and — the interesting
+  one — a genuinely broken PDF fails with the real pdfplumber error message
+  surfaced in the UI, with the failed step correctly pointing at exactly
+  where it died (`reading_pdf`), even though the failure happens in
+  milliseconds, faster than any poll interval. That precision required a
+  real fix during this build: `mark_failed()` originally overwrote `stage`
+  to a generic `'failed'` value, which threw away the one piece of
+  information the progress UI needs; it now leaves `stage` at the last
+  real value reached (`bha/db.py`, covered by `tests/test_stage_tracking.py`).
+  Also confirmed: the "View extracted data" link deep-links correctly into
+  the dashboard (`/?doc={id}`) and displays that exact document.
+- 41 tests passing.
 
 **Not verified — test these yourself:**
 - **The actual Mistral API call.** `api.mistral.ai` is unreachable from the
@@ -204,13 +230,14 @@ the bundled dashboard. `BHA_CORS_ORIGINS` covers the separate-dev-server case.
   round-tripped to a real model.
 - **`api/app.py` under real uvicorn.** `fastapi`/`uvicorn` couldn't be
   installed there either. The routes were verified via a stdlib server
-  mirroring the same shapes, and `app.py` is syntax-checked and reviewed —
-  but it has never actually been started. Run it before trusting it.
-- **Upload flow end-to-end.** The frontend's upload handler is wired against
-  the documented response shapes but was not exercised against a live
-  `POST /api/documents`.
+  reusing the real `bha` package directly (so the actual pipeline and DB
+  logic ran, not a reimplementation), and `app.py` is syntax-checked and
+  reviewed — but the real ASGI app itself has never been started. Run it
+  before trusting it in production.
 - Only two report templates, from one operator, both text-based PDFs. Scanned
   or image-only PDFs, and documents with no TOC, are untested paths.
+- Concurrent uploads (two files processing at once) were not tested; the
+  SQLite single-writer limitation noted below is a real constraint on that.
 
 ---
 
